@@ -40,6 +40,12 @@ fn manifest() -> Value {
         "tools": [],
         "description": "cap context size and track cache reuse",
         "commands": ["/truncate", "/compact", "/cachestats", META],
+        "command_descriptions": {
+            "/truncate": "cap oversized tool results",
+            "/compact": "summarize older context to shrink it",
+            "/cachestats": "prompt-cache hit rate and prefix churn",
+            "/context-budget": "list the context-budget modules",
+        },
         "completion": ["reset"],
         "hooks": ["tool/after", "context/build", "prompt/context"],
         "capabilities": ["host.turn"],
