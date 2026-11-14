@@ -38,6 +38,7 @@ fn manifest() -> Value {
         "protocol": "2.0",
         "sidecar_args": ["sidecar"],
         "tools": [],
+        "description": "cap",
         "commands": ["/truncate", "/compact", "/cachestats", META],
         "completion": ["reset"],
         "hooks": ["tool/after", "context/build", "prompt/context"],
