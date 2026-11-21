@@ -22,10 +22,13 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use serde_json::{Value, json};
 
+#[allow(dead_code)]
 #[path = "mods/cacheopt.rs"]
 mod cacheopt;
+#[allow(dead_code)]
 #[path = "mods/compact.rs"]
 mod compact;
+#[allow(dead_code)]
 #[path = "mods/truncate.rs"]
 mod truncate;
 
@@ -73,11 +76,7 @@ fn result_of(reply: Option<Value>) -> Value {
 /// `context/build` chain: compact → cacheopt. cacheopt is observe-only, so
 /// the reply is compact's (`{messages}` or `{}`); cacheopt fingerprints the
 /// list that will actually be sent.
-fn context_build(
-    req: &Value,
-    watch: &cacheopt::Watch,
-    link: Option<&compact::HostLink>,
-) -> Value {
+fn context_build(req: &Value, watch: &cacheopt::Watch, link: Option<&compact::HostLink>) -> Value {
     let (reply, _) = compact::handle_compact(req, link);
     let result = result_of(reply);
     let mut next = req.clone();
