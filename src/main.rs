@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use serde_json::{Value, json};
 
+mod parts;
+
 #[allow(dead_code)]
 #[path = "mods/cacheopt.rs"]
 mod cacheopt;
@@ -34,7 +36,64 @@ mod truncate;
 
 const META: &str = "/context-budget";
 
-fn manifest() -> Value {
+const PARTS: &[parts::Part] = &[
+    parts::Part {
+        name: "truncate",
+        default: true,
+        description: "cap oversized tool results before they enter context",
+    },
+    parts::Part {
+        name: "compact",
+        default: true,
+        description: "summarize older context to shrink it",
+    },
+    parts::Part {
+        name: "cacheopt",
+        default: true,
+        description: "prompt-cache hit rate and prefix-break warnings",
+    },
+];
+
+fn manifest(parts: &parts::Parts) -> Value {
+    let mut commands: Vec<&str> = vec![META];
+    let mut descriptions = serde_json::Map::new();
+    descriptions.insert(META.into(), json!("list the context-budget modules"));
+    if parts.on("truncate") {
+        commands.push("/truncate");
+        descriptions.insert("/truncate".into(), json!("cap oversized tool results"));
+    }
+    if parts.on("compact") {
+        commands.push("/compact");
+        descriptions.insert(
+            "/compact".into(),
+            json!("summarize older context to shrink it"),
+        );
+    }
+    if parts.on("cacheopt") {
+        commands.push("/cachestats");
+        descriptions.insert(
+            "/cachestats".into(),
+            json!("prompt-cache hit rate and prefix churn"),
+        );
+    }
+    let mut completion: Vec<&str> = Vec::new();
+    if parts.on("cacheopt") {
+        completion.push("reset");
+    }
+    let mut hooks: Vec<&str> = Vec::new();
+    if parts.on("truncate") {
+        hooks.push("tool/after");
+    }
+    if parts.on("compact") || parts.on("cacheopt") {
+        hooks.push("context/build");
+    }
+    if parts.on("cacheopt") {
+        hooks.push("prompt/context");
+    }
+    let mut capabilities: Vec<&str> = Vec::new();
+    if parts.on("compact") {
+        capabilities.push("host.turn");
+    }
     json!({
         "name": "context-budget",
         "version": env!("CARGO_PKG_VERSION"),
@@ -42,28 +101,39 @@ fn manifest() -> Value {
         "sidecar_args": ["sidecar"],
         "tools": [],
         "description": "cap context size and track cache reuse",
-        "commands": ["/truncate", "/compact", "/cachestats", META],
-        "command_descriptions": {
-            "/truncate": "cap oversized tool results",
-            "/compact": "summarize older context to shrink it",
-            "/cachestats": "prompt-cache hit rate and prefix churn",
-            "/context-budget": "list the context-budget modules",
-        },
-        "completion": ["reset"],
-        "hooks": ["tool/after", "context/build", "prompt/context"],
-        "capabilities": ["host.turn"],
+        "commands": commands,
+        "command_descriptions": descriptions,
+        "completion": completion,
+        "hooks": hooks,
+        "capabilities": capabilities,
+        "parts": parts.manifest(PARTS),
     })
 }
 
 /// `/context-budget` — merged-plugin overview.
-fn meta_command() -> String {
-    format!(
-        "gray-context-budget {} — one sidecar, three context-budget modules:\n\
-         \x20 /truncate    cap oversized tool results (head/tail, ~/.gray/truncate/)\n\
-         \x20 /compact     auto-summarize oversized context via host/run (~/.gray/compact/)\n\
-         \x20 /cachestats  prompt-cache prefix-break warnings + hit-rate (~/.gray/cacheopt/)",
+fn meta_command(parts: &parts::Parts) -> String {
+    let mut lines: Vec<String> = vec![format!(
+        "gray-context-budget {} — one sidecar, three context-budget modules:",
         env!("CARGO_PKG_VERSION")
-    )
+    )];
+    if parts.on("truncate") {
+        lines.push(
+            "\x20 /truncate    cap oversized tool results (head/tail, ~/.gray/truncate/)".into(),
+        );
+    }
+    if parts.on("compact") {
+        lines.push(
+            "\x20 /compact     auto-summarize oversized context via host/run (~/.gray/compact/)"
+                .into(),
+        );
+    }
+    if parts.on("cacheopt") {
+        lines.push(
+            "\x20 /cachestats  prompt-cache prefix-break warnings + hit-rate (~/.gray/cacheopt/)"
+                .into(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// Unwrap a module reply to its `result` (or `{}`), for re-wrapping.
@@ -76,14 +146,25 @@ fn result_of(reply: Option<Value>) -> Value {
 /// `context/build` chain: compact → cacheopt. cacheopt is observe-only, so
 /// the reply is compact's (`{messages}` or `{}`); cacheopt fingerprints the
 /// list that will actually be sent.
-fn context_build(req: &Value, watch: &cacheopt::Watch, link: Option<&compact::HostLink>) -> Value {
-    let (reply, _) = compact::handle_compact(req, link);
-    let result = result_of(reply);
-    let mut next = req.clone();
-    if let Some(msgs) = result.get("messages") {
-        next["params"]["messages"] = msgs.clone();
+fn context_build(
+    req: &Value,
+    watch: &cacheopt::Watch,
+    link: Option<&compact::HostLink>,
+    parts: &parts::Parts,
+) -> Value {
+    let result = if parts.on("compact") {
+        let (reply, _) = compact::handle_compact(req, link);
+        result_of(reply)
+    } else {
+        json!({})
+    };
+    if parts.on("cacheopt") {
+        let mut next = req.clone();
+        if let Some(msgs) = result.get("messages") {
+            next["params"]["messages"] = msgs.clone();
+        }
+        let _ = cacheopt::handle_cacheopt(watch, &next);
     }
-    let _ = cacheopt::handle_cacheopt(watch, &next);
     result
 }
 
@@ -91,35 +172,51 @@ fn handle(
     req: &Value,
     watch: &cacheopt::Watch,
     link: Option<&compact::HostLink>,
+    parts: &parts::Parts,
 ) -> (Option<Value>, bool) {
     let id = req.get("id").cloned();
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(Value::Null);
     let Some(id) = id else {
         // Notifications: event/notify turn_end feeds cacheopt's stats.
-        if method == "event/notify" {
+        if method == "event/notify" && parts.on("cacheopt") {
             let _ = cacheopt::handle_cacheopt(watch, req);
         }
         return (None, method == "plugin/shutdown");
     };
     let result = match method {
-        "plugin/manifest" => manifest(),
+        "plugin/manifest" => manifest(parts),
         "tool/after" => {
+            if !parts.on("truncate") {
+                return (Some(json!({ "id": id, "result": {} })), false);
+            }
             let (reply, _) = truncate::handle_truncate(req);
             return (reply, false);
         }
         "prompt/context" => {
+            if !parts.on("cacheopt") {
+                return (Some(json!({ "id": id, "result": {} })), false);
+            }
             let (reply, _) = cacheopt::handle_cacheopt(watch, req);
             return (reply, false);
         }
-        "context/build" => context_build(req, watch, link),
+        "context/build" => {
+            if !parts.on("compact") && !parts.on("cacheopt") {
+                return (Some(json!({ "id": id, "result": {} })), false);
+            }
+            context_build(req, watch, link, parts)
+        }
         "command/run" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             match name {
-                META => json!({ "text": meta_command() }),
-                "/truncate" => result_of(truncate::handle_truncate(req).0),
-                "/compact" => result_of(compact::handle_compact(req, link).0),
-                "/cachestats" => result_of(cacheopt::handle_cacheopt(watch, req).0),
+                META => json!({ "text": meta_command(parts) }),
+                "/truncate" if parts.on("truncate") => result_of(truncate::handle_truncate(req).0),
+                "/compact" if parts.on("compact") => {
+                    result_of(compact::handle_compact(req, link).0)
+                }
+                "/cachestats" if parts.on("cacheopt") => {
+                    result_of(cacheopt::handle_cacheopt(watch, req).0)
+                }
                 _ => json!({ "text": format!("unknown command {name} — try {META}") }),
             }
         }
@@ -139,8 +236,9 @@ fn handle(
 }
 
 fn main() {
+    let parts = parts::Parts::load("context-budget", PARTS);
     if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", manifest());
+        println!("{}", manifest(&parts));
         return;
     }
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
@@ -178,7 +276,7 @@ fn main() {
             pending: pending.clone(),
             counter: counter.clone(),
         };
-        let (reply, exit) = handle(&req, &watch, Some(&link));
+        let (reply, exit) = handle(&req, &watch, Some(&link), &parts);
         if let Some(reply) = reply {
             let mut o = stdout.lock().expect("stdout");
             let _ = writeln!(o, "{reply}");
